@@ -11,7 +11,7 @@ from decimal import ROUND_HALF_UP, Decimal
 from typing import Annotated, Literal, Optional
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Path, Query
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, Field, StrictInt, model_validator
 from pymongo import ASCENDING, DESCENDING, MongoClient, ReturnDocument
@@ -309,6 +309,115 @@ def punch_out(body: PunchOutIn):
     return record_out(updated)
 
 
+# --------------------------------------------------------------------------- #
+# Regularization (PATCH /attendance/{emp_code}/{date})
+# --------------------------------------------------------------------------- #
+TRACKED_FIELDS = ("status", "punch_in", "punch_out", "work_hours", "late_minutes", "overtime_minutes", "half_day")
+ABSENCE_STATUSES = ("ABSENT", "LEAVE")
+
+
+class RegularizeIn(BaseModel):
+    """Derived fields are not declared, so a client sending them is simply ignored."""
+    status: Optional[Status] = None
+    punch_in: Optional[EpochMs] = None
+    punch_out: Optional[EpochMs] = None
+    reason: str = Field(min_length=5, max_length=200)
+    regularized_by: str = Field(min_length=1, max_length=50)
+
+
+def as_utc(dt: Optional[datetime]) -> Optional[datetime]:
+    """PyMongo returns naive datetimes that are really UTC; make them aware."""
+    if dt is not None and dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def derived_fields(status: str, pin: Optional[datetime], pout: Optional[datetime], att: date, emp: dict) -> dict:
+    """R2-R5 for any final state of a record (used after a correction)."""
+    if status in ABSENCE_STATUSES:
+        return {"work_hours": None, "late_minutes": 0, "overtime_minutes": 0, "half_day": False}
+    late = compute_late_minutes(pin, att, emp["shift_start"])
+    if pout is None:
+        return {"work_hours": None, "late_minutes": late, "overtime_minutes": 0, "half_day": False}
+    hours = compute_work_hours(pin, pout)
+    return {
+        "work_hours": hours,
+        "late_minutes": late,
+        "overtime_minutes": compute_overtime(pout, att, emp["shift_start"], emp["shift_end"]),
+        "half_day": hours < 4.5,
+    }
+
+
+@app.patch("/attendance/{emp_code}/{date}")
+def regularize_attendance(
+    body: RegularizeIn,
+    emp_code: str,
+    att: date = Path(alias="date"),
+):
+    emp = db.employees.find_one({"emp_code": emp_code})
+    if emp is None:
+        raise HTTPException(404, "employee not found")
+    rec = db.attendance_logs.find_one({"emp_code": emp_code, "date": att.isoformat()})
+    if rec is None:
+        raise HTTPException(404, "no attendance record for that date")
+
+    # Current state, with legacy defaults (missing half_day -> False, etc.)
+    old = {
+        "status": rec["status"],
+        "punch_in": as_utc(rec.get("punch_in")),
+        "punch_out": as_utc(rec.get("punch_out")),
+        "work_hours": rec.get("work_hours"),
+        "late_minutes": rec.get("late_minutes") or 0,
+        "overtime_minutes": rec.get("overtime_minutes") or 0,
+        "half_day": bool(rec.get("half_day", False)),
+    }
+
+    # Final status and punch times (omitted fields stay unchanged)
+    status = body.status or old["status"]
+    if status in ABSENCE_STATUSES:
+        if body.punch_in is not None or body.punch_out is not None:
+            raise validation_error(["body"], f"{status} clears punch times; do not send punch_in/punch_out")
+        pin = pout = None
+    else:
+        pin = ms_to_dt(body.punch_in) if body.punch_in is not None else old["punch_in"]
+        pout = ms_to_dt(body.punch_out) if body.punch_out is not None else old["punch_out"]
+        if pin is None:
+            raise validation_error(["body", "punch_in"], f"status {status} requires a punch_in")
+        if attendance_date(pin, emp["shift_start"], emp["shift_end"]) != att:
+            raise validation_error(["body", "punch_in"], "punch_in must stay on the record's attendance date")
+        if pout is not None:
+            if pout <= pin:
+                raise validation_error(["body", "punch_out"], "punch_out must be after punch_in")
+            if pout - pin > timedelta(hours=24):
+                raise validation_error(["body", "punch_out"], "punch_out must be within 24 hours of punch_in")
+
+    new = {"status": status, "punch_in": pin, "punch_out": pout, **derived_fields(status, pin, pout, att, emp)}
+    if all(new[f] == old[f] for f in ("status", "punch_in", "punch_out")):
+        raise validation_error(["body"], "request changes nothing")
+    changes = {f: {"from": old[f], "to": new[f]} for f in TRACKED_FIELDS if new[f] != old[f]}
+    entry = {"at": now_utc(), "by": body.regularized_by, "reason": body.reason, "changes": changes}
+
+    # Optimistic concurrency: only apply if the record is exactly as we read it
+    # (same punch fields, same number of history entries). A concurrent winner changes
+    # one of these, so the loser matches nothing and gets 409 instead of losing history.
+    history = rec.get("history")
+    guard = {
+        "_id": rec["_id"],
+        "status": rec["status"],
+        "punch_in": rec.get("punch_in"),
+        "punch_out": rec.get("punch_out"),
+        "history": {"$size": len(history)} if history is not None else {"$exists": False},
+    }
+    updated = db.attendance_logs.find_one_and_update(
+        guard,
+        {"$set": new, "$push": {"history": entry}},
+        return_document=ReturnDocument.AFTER,
+    )
+    if updated is None:
+        raise HTTPException(409, "record was modified concurrently; retry")
+    return record_out(updated)
+
+
 ATTENDANCE_SORT = [("date", DESCENDING), ("emp_code", ASCENDING)]
 
 
@@ -353,7 +462,6 @@ def list_attendance(
 
 # --------------------------------------------------------------------------- #
 # TODO - the rest of the contract (see openapi.yaml):
-#   PATCH /attendance/{emp_code}/{date}
 #   GET   /analytics/employees/{emp_code}/monthly
 #   GET   /analytics/departments/summary
 #   GET   /analytics/leaderboard/late
