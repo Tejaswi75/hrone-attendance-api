@@ -4,12 +4,14 @@ Employee Attendance & Analytics API
 Run:  uvicorn app.main:app --port 8000
 Env:  MONGO_URI, MONGO_DB (a local .env is loaded for convenience)
 """
+import json
 import os
 from contextlib import asynccontextmanager
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Annotated, Literal, Optional
 
+from bson import json_util
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Path, Query
 from fastapi.exceptions import RequestValidationError
@@ -778,6 +780,75 @@ def department_trend(
 
 
 # --------------------------------------------------------------------------- #
-# TODO - the rest of the contract (see openapi.yaml):
-#   GET   /admin/explain/{endpoint}
+# GET /admin/explain/{endpoint}
 # --------------------------------------------------------------------------- #
+ExplainTarget = Literal["attendance_list", "employee_monthly", "department_summary", "late_leaderboard", "department_trend"]
+
+
+def require(**params) -> None:
+    missing = [name for name, value in params.items() if value is None]
+    if missing:
+        raise RequestValidationError(
+            [{"type": "missing", "loc": ["query", name], "msg": "Field required", "input": None} for name in missing]
+        )
+
+
+def explain_aggregate(collection: str, pipeline: list) -> dict:
+    return db.command(
+        "explain", {"aggregate": collection, "pipeline": pipeline, "cursor": {}}, verbosity="executionStats"
+    )
+
+
+@app.get("/admin/explain/{endpoint}")
+def explain_endpoint(
+    endpoint: ExplainTarget,
+    emp_code: Optional[str] = None,
+    month: Optional[str] = Query(None, pattern=MONTH_PATTERN),
+    department: Optional[str] = None,
+    limit: int = Query(10, ge=1, le=50),
+    date_from: Optional[date] = None,
+    date_to: Optional[date] = None,
+    status: Optional[Status] = None,
+    start: Optional[date] = Query(None, alias="from"),
+    end: Optional[date] = Query(None, alias="to"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+):
+    """Explains the main query of an endpoint, built by the same functions the endpoint uses."""
+    if endpoint == "attendance_list":
+        collection = "attendance_logs"
+        result = db.command(
+            "explain",
+            {
+                "find": collection,
+                "filter": attendance_filter(emp_code, date_from, date_to, status),
+                "projection": {"_id": 0},
+                "sort": dict(ATTENDANCE_SORT),
+                "skip": (page - 1) * page_size,
+                "limit": page_size,
+            },
+            verbosity="executionStats",
+        )
+    elif endpoint == "employee_monthly":
+        require(emp_code=emp_code, month=month)
+        collection = "attendance_logs"
+        first, last = month_bounds(month)
+        result = explain_aggregate(collection, employee_monthly_pipeline(emp_code, first, last))
+    elif endpoint == "department_summary":
+        require(month=month)
+        collection = "employees"
+        first, last = month_bounds(month)
+        result = explain_aggregate(collection, department_summary_pipeline(first, last, department))
+    elif endpoint == "late_leaderboard":
+        require(month=month)
+        collection = "attendance_logs"
+        first, last = month_bounds(month)
+        result = explain_aggregate(collection, late_leaderboard_pipeline(first, last, limit, department))
+    else:  # department_trend
+        require(department=department, **{"from": start, "to": end})
+        check_trend_range(start, end)
+        collection = "attendance_logs"
+        emp_codes = db.employees.distinct("emp_code", {"department": department})
+        result = explain_aggregate(collection, department_trend_pipeline(department, emp_codes, start, end))
+    # BSON types (Timestamp, Int64, ...) -> plain JSON
+    return {"endpoint": endpoint, "collection": collection, "explain": json.loads(json_util.dumps(result))}
