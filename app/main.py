@@ -7,13 +7,14 @@ Env:  MONGO_URI, MONGO_DB (a local .env is loaded for convenience)
 import os
 from contextlib import asynccontextmanager
 from datetime import date, datetime, time, timedelta, timezone
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Annotated, Literal, Optional
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, Field, StrictInt, model_validator
-from pymongo import ASCENDING, DESCENDING, MongoClient
+from pymongo import ASCENDING, DESCENDING, MongoClient, ReturnDocument
 from pymongo.errors import DuplicateKeyError
 
 load_dotenv()
@@ -34,6 +35,7 @@ def create_indexes():
         [("emp_code", ASCENDING), ("date", ASCENDING)], unique=True, name="uniq_emp_date"
     )
     db.attendance_logs.create_index([("date", DESCENDING), ("emp_code", ASCENDING)], name="date_desc_emp")
+    db.attendance_logs.create_index([("emp_code", ASCENDING), ("punch_in", DESCENDING)], name="emp_punch_in")
 
 
 @asynccontextmanager
@@ -97,13 +99,23 @@ def compute_late_minutes(punch_in: datetime, att_date: date, shift_start: str) -
 
 
 def compute_work_hours(punch_in: datetime, punch_out: datetime) -> float:
-    return round((punch_out - punch_in).total_seconds() / 3600, 2)
+    """R4: (punch_out - punch_in) seconds / 3600, 2 decimals half-up."""
+    seconds = int((punch_out - punch_in).total_seconds())
+    return float((Decimal(seconds) / Decimal(3600)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
 
 
-def compute_overtime(punch_out: datetime, shift_end: str, date_str: str) -> int:
-    h, m = map(int, shift_end.split(":"))
-    end = datetime.fromisoformat(date_str).replace(hour=h, minute=m, tzinfo=IST)
-    return max(0, int((punch_out - end).total_seconds() / 60))
+def shift_end_at(att_date: date, shift_start: str, shift_end: str) -> datetime:
+    end = datetime.combine(att_date, parse_hhmm(shift_end), tzinfo=IST)
+    if is_overnight(shift_start, shift_end):
+        end += timedelta(days=1)     # overnight shift ends the next calendar day
+    return end
+
+
+def compute_overtime(punch_out: datetime, att_date: date, shift_start: str, shift_end: str) -> int:
+    """R3: whole minutes (floor) after shift end, only if >= 30."""
+    seconds = int((punch_out - shift_end_at(att_date, shift_start, shift_end)).total_seconds())
+    minutes = seconds // 60
+    return minutes if minutes >= 30 else 0
 
 
 # --------------------------------------------------------------------------- #
@@ -168,6 +180,11 @@ class PunchInIn(BaseModel):
     emp_code: str
     punched_at: Optional[EpochMs] = None
     status: PresenceStatus = "PRESENT"
+
+
+class PunchOutIn(BaseModel):
+    emp_code: str
+    punched_at: Optional[EpochMs] = None
 
 
 # --------------------------------------------------------------------------- #
@@ -248,6 +265,50 @@ def punch_in(body: PunchInIn):
     return record_out(doc)
 
 
+@app.post("/attendance/punch-out")
+def punch_out(body: PunchOutIn):
+    emp = db.employees.find_one({"emp_code": body.emp_code})
+    if emp is None:
+        raise HTTPException(404, "employee not found")
+    ts = ms_to_dt(body.punched_at) if body.punched_at is not None else now_utc()
+
+    # Most recent record whose punch_in is at or before punched_at (works across midnight).
+    rec = db.attendance_logs.find_one(
+        {"emp_code": body.emp_code, "punch_in": {"$lte": ts}},
+        sort=[("punch_in", DESCENDING)],
+    )
+    if rec is None:
+        raise HTTPException(404, "no punch-in found")
+    if rec.get("punch_out") is not None:
+        raise HTTPException(409, "already punched out")
+
+    pin = rec["punch_in"]
+    if pin.tzinfo is None:
+        pin = pin.replace(tzinfo=timezone.utc)
+    if ts <= pin:
+        raise validation_error(["body", "punched_at"], "punched_at must be after punch_in")
+    if ts - pin > timedelta(hours=24):
+        raise validation_error(["body", "punched_at"], "punched_at must be within 24 hours of punch_in")
+
+    att = date.fromisoformat(rec["date"])
+    work_hours = compute_work_hours(pin, ts)
+    update = {
+        "punch_out": ts,
+        "work_hours": work_hours,
+        "overtime_minutes": compute_overtime(ts, att, emp["shift_start"], emp["shift_end"]),
+        "half_day": work_hours < 4.5,
+    }
+    # Atomic: only succeeds if nobody punched out in between -> exactly one 200 under a race.
+    updated = db.attendance_logs.find_one_and_update(
+        {"_id": rec["_id"], "punch_out": None},
+        {"$set": update},
+        return_document=ReturnDocument.AFTER,
+    )
+    if updated is None:
+        raise HTTPException(409, "already punched out")
+    return record_out(updated)
+
+
 ATTENDANCE_SORT = [("date", DESCENDING), ("emp_code", ASCENDING)]
 
 
@@ -292,7 +353,6 @@ def list_attendance(
 
 # --------------------------------------------------------------------------- #
 # TODO - the rest of the contract (see openapi.yaml):
-#   POST  /attendance/punch-out
 #   PATCH /attendance/{emp_code}/{date}
 #   GET   /analytics/employees/{emp_code}/monthly
 #   GET   /analytics/departments/summary
