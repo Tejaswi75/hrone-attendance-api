@@ -1,21 +1,19 @@
 """
-Employee Attendance & Analytics API - STARTER
+Employee Attendance & Analytics API
 
 Run:  uvicorn app.main:app --port 8000
 Env:  MONGO_URI, MONGO_DB (a local .env is loaded for convenience)
-
-This file was written quickly by a colleague who has left the company. The happy path
-works, but nobody has reviewed it. Read PROBLEM_STATEMENT.docx for what is expected of you,
-openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
 """
 import os
-from datetime import datetime, timedelta, timezone
+from contextlib import asynccontextmanager
+from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from pymongo import MongoClient
+from fastapi import FastAPI, HTTPException, Query
+from pydantic import BaseModel, Field, model_validator
+from pymongo import ASCENDING, MongoClient
+from pymongo.errors import DuplicateKeyError
 
 load_dotenv()
 
@@ -24,12 +22,32 @@ db = client[os.getenv("MONGO_DB", "attendance_db")]
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
-app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0")
+
+def create_indexes():
+    db.employees.create_index([("emp_code", ASCENDING)], unique=True, name="uniq_emp_code")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    create_indexes()
+    yield
+
+
+app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0", lifespan=lifespan)
 
 
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
+def to_ms(dt: Optional[datetime]) -> Optional[int]:
+    """BSON datetime -> epoch milliseconds."""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:          # pymongo naive datetime = UTC
+        dt = dt.replace(tzinfo=timezone.utc)
+    return int(dt.timestamp() * 1000)
+
+
 def compute_late_minutes(punch_in: datetime, shift_start: str) -> int:
     h, m = map(int, shift_start.split(":"))
     start = punch_in.replace(hour=h, minute=m, second=0, microsecond=0)
@@ -50,14 +68,23 @@ def compute_overtime(punch_out: datetime, shift_end: str, date_str: str) -> int:
 # --------------------------------------------------------------------------- #
 # Models
 # --------------------------------------------------------------------------- #
+HHMM = r"^([01]\d|2[0-3]):[0-5]\d$"
+
+
 class EmployeeIn(BaseModel):
-    emp_code: str
-    name: str
-    email: str
-    department: str
-    shift_start: str = "09:30"
-    shift_end: str = "18:30"
-    joined_on: str
+    emp_code: str = Field(pattern=r"^EMP\d{4,6}$")
+    name: str = Field(min_length=1, max_length=100)
+    email: str = Field(max_length=120, pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+    department: str = Field(min_length=1, max_length=50)
+    shift_start: str = Field("09:30", pattern=HHMM)
+    shift_end: str = Field("18:30", pattern=HHMM)
+    joined_on: date
+
+    @model_validator(mode="after")
+    def check_shift(self):
+        if self.shift_start == self.shift_end:
+            raise ValueError("shift_start must differ from shift_end")
+        return self
 
 
 class PunchInIn(BaseModel):
@@ -67,7 +94,7 @@ class PunchInIn(BaseModel):
 
 
 # --------------------------------------------------------------------------- #
-# Endpoints provided
+# Endpoints
 # --------------------------------------------------------------------------- #
 @app.get("/health")
 def health():
@@ -76,23 +103,41 @@ def health():
 
 @app.post("/employees", status_code=201)
 def create_employee(body: EmployeeIn):
-    if db.employees.find_one({"emp_code": body.emp_code}):
-        raise HTTPException(409, "emp_code already exists")
+    now = datetime.now(timezone.utc)
+    now = now.replace(microsecond=now.microsecond // 1000 * 1000)  # Mongo stores ms
     doc = body.model_dump()
-    doc["created_at"] = datetime.now()
-    db.employees.insert_one(doc)
+    doc["joined_on"] = body.joined_on.isoformat()
+    doc["created_at"] = now
+    try:
+        db.employees.insert_one(doc)
+    except DuplicateKeyError:
+        raise HTTPException(409, "emp_code already exists")
     doc.pop("_id", None)
+    doc["created_at"] = to_ms(now)
     return doc
 
 
 @app.get("/employees")
-def list_employees(department: Optional[str] = None, page: int = 1, page_size: int = 20):
+def list_employees(
+    department: Optional[str] = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+):
     q = {}
-    if department:
+    if department is not None:
         q["department"] = department
-    skip = page * page_size
-    total = db.employees.count_documents({})
-    items = list(db.employees.find(q, {"_id": 0}).skip(skip).limit(page_size))
+    skip = (page - 1) * page_size
+    total = db.employees.count_documents(q)
+    cursor = (
+        db.employees.find(q, {"_id": 0})
+        .sort("emp_code", 1)
+        .skip(skip)
+        .limit(page_size)
+    )
+    items = []
+    for doc in cursor:
+        doc["created_at"] = to_ms(doc.get("created_at"))
+        items.append(doc)
     return {"items": items, "total": total, "page": page, "page_size": page_size}
 
 
