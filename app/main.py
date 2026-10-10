@@ -11,8 +11,9 @@ from typing import Annotated, Literal, Optional
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, Field, StrictInt, model_validator
-from pymongo import ASCENDING, MongoClient
+from pymongo import ASCENDING, DESCENDING, MongoClient
 from pymongo.errors import DuplicateKeyError
 
 load_dotenv()
@@ -32,6 +33,7 @@ def create_indexes():
     db.attendance_logs.create_index(
         [("emp_code", ASCENDING), ("date", ASCENDING)], unique=True, name="uniq_emp_date"
     )
+    db.attendance_logs.create_index([("date", DESCENDING), ("emp_code", ASCENDING)], name="date_desc_emp")
 
 
 @asynccontextmanager
@@ -138,6 +140,12 @@ def record_out(doc: dict) -> dict:
 HHMM = r"^([01]\d|2[0-3]):[0-5]\d$"
 EpochMs = Annotated[StrictInt, Field(ge=100_000_000_000, le=4_102_444_800_000)]
 PresenceStatus = Literal["PRESENT", "WFH", "ON_DUTY"]
+Status = Literal["PRESENT", "ABSENT", "LEAVE", "WFH", "ON_DUTY"]
+
+
+def validation_error(loc: list, msg: str) -> RequestValidationError:
+    """422 in FastAPI's default shape, for checks Pydantic cannot express."""
+    return RequestValidationError([{"type": "value_error", "loc": loc, "msg": msg, "input": None}])
 
 
 class EmployeeIn(BaseModel):
@@ -240,33 +248,46 @@ def punch_in(body: PunchInIn):
     return record_out(doc)
 
 
-@app.get("/attendance")
-def list_attendance(
-    emp_code: Optional[str] = None,
-    date_from: Optional[str] = None,
-    date_to: Optional[str] = None,
-    status: Optional[str] = None,
-    page: int = 1,
-    page_size: int = 20,
-):
+ATTENDANCE_SORT = [("date", DESCENDING), ("emp_code", ASCENDING)]
+
+
+def attendance_filter(
+    emp_code: Optional[str], date_from: Optional[date], date_to: Optional[date], status: Optional[str]
+) -> dict:
+    if date_from and date_to and date_from > date_to:
+        raise validation_error(["query", "date_from"], "date_from must not be after date_to")
     q = {}
-    if emp_code:
+    if emp_code is not None:
         q["emp_code"] = emp_code
     if date_from or date_to:
         q["date"] = {}
         if date_from:
-            q["date"]["$gte"] = date_from
+            q["date"]["$gte"] = date_from.isoformat()
         if date_to:
-            q["date"]["$lte"] = date_to
-    if status:
+            q["date"]["$lte"] = date_to.isoformat()
+    if status is not None:
         q["status"] = status
-    docs = list(db.attendance_logs.find(q))
-    docs.sort(key=lambda d: d["date"], reverse=True)
-    total = len(docs)
-    page_docs = docs[(page - 1) * page_size : page * page_size]
-    for d in page_docs:
-        d["id"] = str(d.pop("_id"))
-    return {"items": page_docs, "total": total, "page": page, "page_size": page_size}
+    return q
+
+
+@app.get("/attendance")
+def list_attendance(
+    emp_code: Optional[str] = None,
+    date_from: Optional[date] = None,
+    date_to: Optional[date] = None,
+    status: Optional[Status] = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+):
+    q = attendance_filter(emp_code, date_from, date_to, status)
+    total = db.attendance_logs.count_documents(q)
+    cursor = (
+        db.attendance_logs.find(q, {"_id": 0})
+        .sort(ATTENDANCE_SORT)
+        .skip((page - 1) * page_size)
+        .limit(page_size)
+    )
+    return {"items": [record_out(d) for d in cursor], "total": total, "page": page, "page_size": page_size}
 
 
 # --------------------------------------------------------------------------- #
