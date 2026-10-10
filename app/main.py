@@ -6,12 +6,12 @@ Env:  MONGO_URI, MONGO_DB (a local .env is loaded for convenience)
 """
 import os
 from contextlib import asynccontextmanager
-from datetime import date, datetime, timedelta, timezone
-from typing import Optional
+from datetime import date, datetime, time, timedelta, timezone
+from typing import Annotated, Literal, Optional
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, StrictInt, model_validator
 from pymongo import ASCENDING, MongoClient
 from pymongo.errors import DuplicateKeyError
 
@@ -24,10 +24,14 @@ client = MongoClient(
 db = client[os.getenv("MONGO_DB", "attendance_db")]
 
 IST = timezone(timedelta(hours=5, minutes=30))
+EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 
 def create_indexes():
     db.employees.create_index([("emp_code", ASCENDING)], unique=True, name="uniq_emp_code")
+    db.attendance_logs.create_index(
+        [("emp_code", ASCENDING), ("date", ASCENDING)], unique=True, name="uniq_emp_date"
+    )
 
 
 @asynccontextmanager
@@ -40,22 +44,54 @@ app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0", life
 
 
 # --------------------------------------------------------------------------- #
-# Helpers
+# Time helpers
 # --------------------------------------------------------------------------- #
 def to_ms(dt: Optional[datetime]) -> Optional[int]:
-    """BSON datetime -> epoch milliseconds."""
+    """BSON datetime -> epoch milliseconds (integer maths, no float error)."""
     if dt is None:
         return None
     if dt.tzinfo is None:          # pymongo naive datetime = UTC
         dt = dt.replace(tzinfo=timezone.utc)
-    return int(dt.timestamp() * 1000)
+    return (dt - EPOCH) // timedelta(milliseconds=1)
 
 
-def compute_late_minutes(punch_in: datetime, shift_start: str) -> int:
-    h, m = map(int, shift_start.split(":"))
-    start = punch_in.replace(hour=h, minute=m, second=0, microsecond=0)
-    minutes = int((punch_in - start).total_seconds() / 60)
-    return minutes if minutes > 10 else 0
+def ms_to_dt(ms: int) -> datetime:
+    """Epoch ms -> aware UTC datetime, truncated to whole seconds (R1)."""
+    return EPOCH + timedelta(seconds=ms // 1000)
+
+
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc).replace(microsecond=0)
+
+
+def parse_hhmm(s: str) -> time:
+    h, m = map(int, s.split(":"))
+    return time(h, m)
+
+
+def is_overnight(shift_start: str, shift_end: str) -> bool:
+    return parse_hhmm(shift_end) <= parse_hhmm(shift_start)
+
+
+def attendance_date(punch_in: datetime, shift_start: str, shift_end: str) -> date:
+    """R1: IST date of the punch-in; for an overnight shift, a punch-in before
+    shift_end belongs to the shift that started the previous day."""
+    local = punch_in.astimezone(IST)
+    d = local.date()
+    if is_overnight(shift_start, shift_end) and local.time() < parse_hhmm(shift_end):
+        d -= timedelta(days=1)
+    return d
+
+
+def shift_start_at(att_date: date, shift_start: str) -> datetime:
+    return datetime.combine(att_date, parse_hhmm(shift_start), tzinfo=IST)
+
+
+def compute_late_minutes(punch_in: datetime, att_date: date, shift_start: str) -> int:
+    """R2: late only if strictly more than 10:00 after shift start;
+    then whole minutes (floor) since shift start."""
+    seconds = int((punch_in - shift_start_at(att_date, shift_start)).total_seconds())
+    return seconds // 60 if seconds > 600 else 0
 
 
 def compute_work_hours(punch_in: datetime, punch_out: datetime) -> float:
@@ -69,9 +105,39 @@ def compute_overtime(punch_out: datetime, shift_end: str, date_str: str) -> int:
 
 
 # --------------------------------------------------------------------------- #
+# Serialisation (Mongo document -> API JSON)
+# --------------------------------------------------------------------------- #
+def history_out(h: dict) -> dict:
+    changes = {}
+    for field, ch in (h.get("changes") or {}).items():
+        if field in ("punch_in", "punch_out"):
+            changes[field] = {"from": to_ms(ch.get("from")), "to": to_ms(ch.get("to"))}
+        else:
+            changes[field] = ch
+    return {"at": to_ms(h.get("at")), "by": h.get("by"), "reason": h.get("reason"), "changes": changes}
+
+
+def record_out(doc: dict) -> dict:
+    return {
+        "emp_code": doc["emp_code"],
+        "date": doc["date"],
+        "status": doc["status"],
+        "punch_in": to_ms(doc.get("punch_in")),
+        "punch_out": to_ms(doc.get("punch_out")),
+        "work_hours": doc.get("work_hours"),
+        "late_minutes": doc.get("late_minutes") or 0,
+        "overtime_minutes": doc.get("overtime_minutes") or 0,
+        "half_day": bool(doc.get("half_day", False)),
+        "history": [history_out(h) for h in (doc.get("history") or [])],
+    }
+
+
+# --------------------------------------------------------------------------- #
 # Models
 # --------------------------------------------------------------------------- #
 HHMM = r"^([01]\d|2[0-3]):[0-5]\d$"
+EpochMs = Annotated[StrictInt, Field(ge=100_000_000_000, le=4_102_444_800_000)]
+PresenceStatus = Literal["PRESENT", "WFH", "ON_DUTY"]
 
 
 class EmployeeIn(BaseModel):
@@ -92,8 +158,8 @@ class EmployeeIn(BaseModel):
 
 class PunchInIn(BaseModel):
     emp_code: str
-    punched_at: Optional[int] = None
-    status: str = "PRESENT"
+    punched_at: Optional[EpochMs] = None
+    status: PresenceStatus = "PRESENT"
 
 
 # --------------------------------------------------------------------------- #
@@ -151,26 +217,27 @@ def list_employees(
 @app.post("/attendance/punch-in", status_code=201)
 def punch_in(body: PunchInIn):
     emp = db.employees.find_one({"emp_code": body.emp_code})
-    ts = datetime.fromtimestamp(body.punched_at / 1000) if body.punched_at else datetime.now()
-    d = ts.date().isoformat()
-    if db.attendance_logs.find_one({"emp_code": body.emp_code, "date": d}):
-        raise HTTPException(409, "already punched in for this date")
+    if emp is None:
+        raise HTTPException(404, "employee not found")
+    ts = ms_to_dt(body.punched_at) if body.punched_at is not None else now_utc()
+    att = attendance_date(ts, emp["shift_start"], emp["shift_end"])
     doc = {
         "emp_code": body.emp_code,
-        "date": d,
+        "date": att.isoformat(),
         "status": body.status,
         "punch_in": ts,
         "punch_out": None,
         "work_hours": None,
-        "late_minutes": compute_late_minutes(ts, emp["shift_start"]),
+        "late_minutes": compute_late_minutes(ts, att, emp["shift_start"]),
         "overtime_minutes": 0,
         "half_day": False,
         "history": [],
     }
-    res = db.attendance_logs.insert_one(doc)
-    doc["id"] = str(res.inserted_id)
-    doc.pop("_id", None)
-    return doc
+    try:
+        db.attendance_logs.insert_one(doc)
+    except DuplicateKeyError:
+        raise HTTPException(409, "already punched in for this date")
+    return record_out(doc)
 
 
 @app.get("/attendance")
